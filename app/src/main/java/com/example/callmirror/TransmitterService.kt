@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
+import android.media.AudioManager
 import android.os.Build
 import android.os.IBinder
 import android.telephony.TelephonyManager
@@ -17,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.net.Socket
 
@@ -37,6 +39,9 @@ class TransmitterService : Service() {
 
         const val EXTRA_STATE = "extra_state"
         const val EXTRA_NUMBER = "extra_number"
+
+        // أضفنا حالة الرد هنا عشان نستخدمها مباشرة حتى لو مش متعرفة في CallPayload
+        const val CMD_STATUS_ANSWER = "ANSWER"
 
         var isRunning = false
             private set
@@ -64,10 +69,7 @@ class TransmitterService : Service() {
             cloudMirrorManager = CloudMirrorManager(
                 context = applicationContext,
                 onMessageReceived = { payload ->
-                    if (payload.status == CallPayload.STATUS_REJECT) {
-                        Log.d(TAG, "Received authenticated REJECT command")
-                        rejectIncomingCall()
-                    }
+                    handleIncomingCommand(payload.status)
                 }
             )
             cloudMirrorManager?.connect(pairingCode)
@@ -79,6 +81,7 @@ class TransmitterService : Service() {
 
         if (action == ACTION_STOP) {
             cloudMirrorManager?.disconnect()
+            resetAudioRouting()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
@@ -114,10 +117,7 @@ class TransmitterService : Service() {
                 cloudMirrorManager = CloudMirrorManager(
                     context = applicationContext,
                     onMessageReceived = { payload ->
-                        if (payload.status == CallPayload.STATUS_REJECT) {
-                            Log.d(TAG, "Received authenticated REJECT command")
-                            rejectIncomingCall()
-                        }
+                        handleIncomingCommand(payload.status)
                     }
                 )
                 cloudMirrorManager?.connect(pairingCode)
@@ -161,8 +161,8 @@ class TransmitterService : Service() {
         try {
             val code = prefs.getString("cloud_pairing_code", "") ?: ""
             val payload = SecureTransport.receive(socket, code)
-            if (payload?.status == CallPayload.STATUS_REJECT) {
-                rejectIncomingCall()
+            if (payload != null) {
+                handleIncomingCommand(payload.status)
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error handling command: ${e.message}")
@@ -173,8 +173,86 @@ class TransmitterService : Service() {
         }
     }
 
+    private fun handleIncomingCommand(status: String) {
+        when (status) {
+            CallPayload.STATUS_REJECT -> {
+                Log.d(TAG, "Received authenticated REJECT command")
+                rejectIncomingCall()
+            }
+            CMD_STATUS_ANSWER -> {
+                Log.d(TAG, "Received authenticated ANSWER command")
+                answerIncomingCall()
+            }
+        }
+    }
+
+    private fun answerIncomingCall() {
+        Log.d(TAG, "Answering incoming phone call via TelecomManager & Routing Audio...")
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        this,
+                        android.Manifest.permission.ANSWER_PHONE_CALLS
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    @Suppress("DEPRECATION")
+                    telecomManager?.acceptRingingCall()
+                    Log.d(TAG, "telecomManager.acceptRingingCall() executed successfully")
+
+                    // توجيه الصوت للبلوتوث (أو السبيكر لو مفعل في الإعدادات) بعد نصف ثانية من فتح الخط
+                    scope.launch {
+                        delay(500)
+                        routeAudioToBluetoothOrSpeaker()
+                    }
+                } else {
+                    Log.w(TAG, "ANSWER_PHONE_CALLS permission not granted on transmitter")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to answer call: ${e.message}")
+        }
+    }
+
+    private fun routeAudioToBluetoothOrSpeaker() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_IN_CALL
+
+            val useSpeakerFallback = prefs.getBoolean("use_speaker_fallback", false)
+            if (!useSpeakerFallback) {
+                // تفعيل مسار صوت البلوتوث للمكالمات (SCO)
+                audioManager.isBluetoothScoOn = true
+                audioManager.startBluetoothSco()
+                Log.d(TAG, "Audio routed to Bluetooth SCO")
+            } else {
+                // خيار بديل لو حبيت تفتح السبيكر
+                audioManager.isSpeakerphoneOn = true
+                Log.d(TAG, "Audio routed to Speakerphone")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio routing error: ${e.message}")
+        }
+    }
+
+    private fun resetAudioRouting() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (audioManager.isBluetoothScoOn) {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+            if (audioManager.isSpeakerphoneOn) {
+                audioManager.isSpeakerphoneOn = false
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resetting audio: ${e.message}")
+        }
+    }
+
     private fun rejectIncomingCall() {
-        Log.d(TAG, "Rejecting incoming phone call via TelecomManager...")
+        Log.d(TAG, "Rejecting/Ending phone call via TelecomManager...")
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
@@ -192,6 +270,8 @@ class TransmitterService : Service() {
             }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to end call: ${e.message}")
+        } finally {
+            resetAudioRouting()
         }
     }
 
@@ -199,13 +279,12 @@ class TransmitterService : Service() {
         val receiverIpRaw = prefs.getString("receiver_ip", "") ?: ""
         val receiverPort = prefs.getInt("receiver_port", 8080)
 
-        // Support up to 4 receiver devices (separated by commas, semicolons, or spaces)
         val targetIps = if (receiverIpRaw.isNotBlank()) {
             receiverIpRaw.split("[,;\\s]+".toRegex())
                 .map { it.trim() }
                 .filter { it.isNotBlank() }
                 .distinct()
-                .take(4) // Max 4 receiver devices
+                .take(4)
         } else {
             emptyList()
         }
@@ -226,18 +305,21 @@ class TransmitterService : Service() {
                         name = callerName ?: callerNumber ?: "Unknown Caller"
                     )
                     
-                    // Dispatch concurrently to all target devices on local network
                     targetIps.forEach { ip ->
                         launch {
                             sendPayload(ip, receiverPort, payload)
                         }
                     }
 
-                    // Always dispatch to Cloud Relay if configured (even without local receiver IP)
                     cloudMirrorManager?.sendPayload(payload)
                     Log.d(TAG, "Dispatched RINGING payload to cloud and ${targetIps.size} local devices")
                 }
-                "OFFHOOK", "IDLE", TelephonyManager.EXTRA_STATE_OFFHOOK, TelephonyManager.EXTRA_STATE_IDLE -> {
+                "OFFHOOK", TelephonyManager.EXTRA_STATE_OFFHOOK -> {
+                    // المكالمة شغالة حالياً (تم الرد) - منقفلش الشاشة على التليفون الأساسي عشان يقدر يدوس إنهاء لما يخلص
+                    Log.d(TAG, "Call is now OFFHOOK (Active)")
+                }
+                "IDLE", TelephonyManager.EXTRA_STATE_IDLE -> {
+                    resetAudioRouting()
                     val payload = CallPayload(
                         status = CallPayload.STATUS_ENDED
                     )
@@ -332,6 +414,7 @@ class TransmitterService : Service() {
             instance = null
         }
         isRunning = false
+        resetAudioRouting()
         try {
             commandServerSocket?.close()
         } catch (ignored: Exception) {}
