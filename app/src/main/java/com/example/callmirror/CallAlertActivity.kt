@@ -43,6 +43,18 @@ class CallAlertActivity : AppCompatActivity() {
         binding.tvCallerName.text = callerName
         binding.tvCallerNumber.text = callerNumber
 
+        // زرار الرد (Answer) - يرسل أمر الرد للتليفون الاحتياطي
+        // ملحوظة: تأكد إن عندك btnAnswerCall في ملف الـ XML الخاص بالواجهة (activity_call_alert.xml)
+        binding.root.findViewById<android.widget.Button>(R.id.btnAnswerCall)?.setOnClickListener {
+            val answerIntent = Intent(this, ReceiverService::class.java).apply {
+                action = ReceiverService.ACTION_ANSWER // هنضيف الأكشن ده في ReceiverService
+            }
+            startService(answerIntent)
+            // مكنتش تقفل الشاشة فوراً لو حابب تتابع حالة المكالمة، أو تقفلها لو اكتفيت بالرد
+            finish()
+        }
+
+        // زرار الرفض / إنهاء المكالمة
         binding.btnDismissCall.setOnClickListener {
             val stopIntent = Intent(this, ReceiverService::class.java).apply {
                 action = ReceiverService.ACTION_DISMISS
