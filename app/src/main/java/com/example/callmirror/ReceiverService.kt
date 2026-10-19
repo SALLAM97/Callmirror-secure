@@ -8,17 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.media.AudioAttributes
 import android.media.AudioManager
-import android.media.MediaPlayer
-import android.media.Ringtone
-import android.media.RingtoneManager
 import android.os.Build
 import android.os.IBinder
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
-import android.provider.Settings
+import android.telephony.TelephonyManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
@@ -27,58 +20,59 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.net.ServerSocket
 import java.net.Socket
 
-class ReceiverService : Service() {
+class TransmitterService : Service() {
 
     private val job = SupervisorJob()
     private val scope = CoroutineScope(Dispatchers.IO + job)
-    private var serverSocket: ServerSocket? = null
     private lateinit var prefs: SharedPreferences
-    private var overlayManager: OverlayCallManager? = null
-    private var mediaPlayer: MediaPlayer? = null
-    private var currentRingtone: Ringtone? = null
-    private var vibrator: Vibrator? = null
 
     companion object {
-        const val TAG = "ReceiverService"
-        const val CHANNEL_ID = "receiver_service_channel"
-        const val ALERT_CHANNEL_ID = "receiver_call_alert_channel"
-        const val NOTIFICATION_ID = 2001
-        const val ALERT_NOTIFICATION_ID = 2002
+        const val TAG = "TransmitterService"
+        const val CHANNEL_ID = "transmitter_service_channel"
+        const val NOTIFICATION_ID = 1001
 
-        const val ACTION_START = "com.example.callmirror.RECEIVER_START"
-        const val ACTION_STOP = "com.example.callmirror.RECEIVER_STOP"
-        const val ACTION_DISMISS = "com.example.callmirror.DISMISS_ALERT"
+        const val ACTION_START = "com.example.callmirror.TRANSMITTER_START"
+        const val ACTION_STOP = "com.example.callmirror.TRANSMITTER_STOP"
+        const val ACTION_SEND_CALL_STATE = "com.example.callmirror.TRANSMITTER_SEND"
+
+        const val EXTRA_STATE = "extra_state"
+        const val EXTRA_NUMBER = "extra_number"
+
+        // أضفنا حالة الرد هنا عشان نستخدمها مباشرة حتى لو مش متعرفة في CallPayload
+        const val CMD_STATUS_ANSWER = "ANSWER"
 
         var isRunning = false
             private set
-        var lastTransmitterIp: String? = null
+
+        var instance: TransmitterService? = null
+            private set
+
+        fun broadcastNotificationPayload(payload: CallPayload) {
+            instance?.dispatchNotificationPayload(payload)
+        }
     }
 
     private var cloudMirrorManager: CloudMirrorManager? = null
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         prefs = getSharedPreferences("call_mirror_prefs", Context.MODE_PRIVATE)
-        overlayManager = OverlayCallManager(
-            context = applicationContext,
-            onDismissRequested = {
-                dismissCurrentAlert()
-            }
-        )
-        initVibrator()
-        createNotificationChannels()
-    }
+        createNotificationChannel()
 
-    private fun initVibrator() {
-        vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-            vibratorManager?.defaultVibrator
-        } else {
-            @Suppress("DEPRECATION")
-            getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+        val isRemoteMode = prefs.getInt("app_mode", 0) == 2 // MODE_REMOTE
+        val pairingCode = prefs.getString("cloud_pairing_code", "") ?: ""
+
+        if (isRemoteMode && pairingCode.isNotBlank()) {
+            cloudMirrorManager = CloudMirrorManager(
+                context = applicationContext,
+                onMessageReceived = { payload ->
+                    handleIncomingCommand(payload.status)
+                }
+            )
+            cloudMirrorManager?.connect(pairingCode)
         }
     }
 
@@ -87,38 +81,21 @@ class ReceiverService : Service() {
 
         if (action == ACTION_STOP) {
             cloudMirrorManager?.disconnect()
+            resetAudioRouting()
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return START_NOT_STICKY
         }
 
-        if (action == ACTION_DISMISS) {
-            dismissCurrentAlert()
+        if (action == ACTION_SEND_CALL_STATE) {
+            val state = intent?.getStringExtra(EXTRA_STATE) ?: ""
+            val number = intent?.getStringExtra(EXTRA_NUMBER)
+            handleCallStateChange(state, number)
             return START_STICKY
         }
 
-        val isRemoteMode = prefs.getInt("app_mode", 0) == 2
-        val enableReceiverCloud = prefs.getBoolean("enable_receiver_cloud", false)
-        val receiverCloudCode = prefs.getString("receiver_cloud_code", "") ?: ""
-        val cloudPairingCode = prefs.getString("cloud_pairing_code", "") ?: ""
-        
-        val activePairingCode = if (isRemoteMode) cloudPairingCode else (if (enableReceiverCloud) receiverCloudCode else "")
-
-        if (activePairingCode.isNotBlank() && cloudMirrorManager == null) {
-            Log.d(TAG, "Starting CloudMirrorManager for simultaneous cloud receiving")
-            cloudMirrorManager = CloudMirrorManager(
-                context = applicationContext,
-                onMessageReceived = { payload ->
-                    Log.d(TAG, "Receiver got Cloud message")
-                    processPayload(payload)
-                }
-            )
-            cloudMirrorManager?.connect(activePairingCode)
-        }
-
-        val port = prefs.getInt("listen_port", 8080)
-
-        val notification = buildForegroundNotification(port)
+        // Start Foreground Service
+        val notification = buildNotification("Monitoring incoming calls (Hotspot & Cloud)...")
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
@@ -130,64 +107,65 @@ class ReceiverService : Service() {
             } else {
                 startForeground(NOTIFICATION_ID, notification)
             }
-            if (!isRunning || serverSocket == null || serverSocket?.isClosed == true) {
-                isRunning = true
-                startServer(port)
+            isRunning = true
+            startCommandListener()
+
+            val enableCloudTransmit = prefs.getBoolean("enable_cloud_transmit", true)
+            val pairingCode = prefs.getString("cloud_pairing_code", "") ?: ""
+            if (enableCloudTransmit && pairingCode.isNotBlank() && cloudMirrorManager == null) {
+                Log.d(TAG, "Starting CloudMirrorManager for Transmitter")
+                cloudMirrorManager = CloudMirrorManager(
+                    context = applicationContext,
+                    onMessageReceived = { payload ->
+                        handleIncomingCommand(payload.status)
+                    }
+                )
+                cloudMirrorManager?.connect(pairingCode)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Receiver startForeground error: ${e.message}")
+            Log.e(TAG, "Could not startForeground: ${e.message}")
             isRunning = false
         }
 
         return START_STICKY
     }
 
-    private fun startServer(port: Int) {
+    private var commandServerSocket: java.net.ServerSocket? = null
+
+    private fun startCommandListener() {
+        val cmdPort = prefs.getInt("transmitter_cmd_port", 8081)
         scope.launch {
             try {
-                if (serverSocket == null || serverSocket?.isClosed == true) {
-                    serverSocket = ServerSocket(port)
-                    Log.d(TAG, "Server socket successfully listening on port $port")
-                }
+                commandServerSocket?.close()
+                commandServerSocket = java.net.ServerSocket(cmdPort)
+                Log.d(TAG, "Transmitter command listener started on port $cmdPort")
 
                 while (isRunning) {
-                    val clientSocket: Socket = try {
-                        serverSocket?.accept() ?: break
+                    val clientSocket = try {
+                        commandServerSocket?.accept() ?: break
                     } catch (e: Exception) {
-                        if (isRunning) {
-                            Log.w(TAG, "accept() temporary error: ${e.message}")
-                            delay(500)
-                            continue
-                        } else {
-                            break
-                        }
+                        break
                     }
 
                     launch {
-                        handleClient(clientSocket)
+                        handleCommandClient(clientSocket)
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Server exception on port $port: ${e.message}")
+                Log.e(TAG, "Command listener exception on port $cmdPort: ${e.message}")
             }
         }
     }
 
-    private fun handleClient(socket: Socket) {
+    private fun handleCommandClient(socket: Socket) {
         try {
-            val localCode = prefs.getString("receiver_cloud_code", "")?.takeIf { it.isNotBlank() }
-                ?: prefs.getString("cloud_pairing_code", "") ?: ""
-            // Only encrypted + authenticated messages are accepted; everything else is dropped.
-            val payload = SecureTransport.receive(socket, localCode)
+            val code = prefs.getString("cloud_pairing_code", "") ?: ""
+            val payload = SecureTransport.receive(socket, code)
             if (payload != null) {
-                val remoteIp = socket.inetAddress.hostAddress
-                if (!remoteIp.isNullOrBlank()) {
-                    lastTransmitterIp = remoteIp
-                }
-                processPayload(payload)
+                handleIncomingCommand(payload.status)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error handling client connection")
+            Log.e(TAG, "Error handling command: ${e.message}")
         } finally {
             try {
                 socket.close()
@@ -195,259 +173,189 @@ class ReceiverService : Service() {
         }
     }
 
-    private fun processPayload(payload: CallPayload) {
-        when (payload.status) {
-            CallPayload.STATUS_RINGING -> {
-                Log.d(TAG, "Incoming call alert triggered")
-
-                // Play system ringtone loudly via STREAM_MUSIC or STREAM_RING
-                triggerRingtoneAndVibrate()
-
-                // Display compact heads-up overlay banner
-                val canDrawOverlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    Settings.canDrawOverlays(this)
-                } else {
-                    true
-                }
-
-                if (canDrawOverlay) {
-                    overlayManager?.showOverlay(payload.name, payload.number)
-                }
-
-                showHeadsUpNotification(payload.name, payload.number)
+    private fun handleIncomingCommand(status: String) {
+        when (status) {
+            CallPayload.STATUS_REJECT -> {
+                Log.d(TAG, "Received authenticated REJECT command")
+                rejectIncomingCall()
             }
-            CallPayload.STATUS_ENDED -> {
-                Log.d(TAG, "Call ended or dismissed")
-                dismissCurrentAlert()
-            }
-            CallPayload.STATUS_NOTIFICATION -> {
-                Log.d(TAG, "Received mirrored app notification")
-                showMirroredNotification(payload.appName, payload.title, payload.text)
+            CMD_STATUS_ANSWER -> {
+                Log.d(TAG, "Received authenticated ANSWER command")
+                answerIncomingCall()
             }
         }
     }
 
-    private fun showMirroredNotification(appName: String?, title: String?, text: String?) {
-        val prefs = getSharedPreferences("call_mirror_prefs", Context.MODE_PRIVATE)
-        val shouldReceiveNotifications = prefs.getBoolean("mirror_notifications", true)
-        if (!shouldReceiveNotifications) return
+    private fun answerIncomingCall() {
+        Log.d(TAG, "Answering incoming phone call via TelecomManager & Routing Audio...")
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        this,
+                        android.Manifest.permission.ANSWER_PHONE_CALLS
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    @Suppress("DEPRECATION")
+                    telecomManager?.acceptRingingCall()
+                    Log.d(TAG, "telecomManager.acceptRingingCall() executed successfully")
 
-        val nm = getSystemService(NotificationManager::class.java)
-        val notifChannelId = "mirrored_app_notifications"
+                    // توجيه الصوت للبلوتوث (أو السبيكر لو مفعل في الإعدادات) بعد نصف ثانية من فتح الخط
+                    scope.launch {
+                        delay(500)
+                        routeAudioToBluetoothOrSpeaker()
+                    }
+                } else {
+                    Log.w(TAG, "ANSWER_PHONE_CALLS permission not granted on transmitter")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to answer call: ${e.message}")
+        }
+    }
 
+    private fun routeAudioToBluetoothOrSpeaker() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audioManager.mode = AudioManager.MODE_IN_CALL
+
+            val useSpeakerFallback = prefs.getBoolean("use_speaker_fallback", false)
+            if (!useSpeakerFallback) {
+                // تفعيل مسار صوت البلوتوث للمكالمات (SCO)
+                audioManager.isBluetoothScoOn = true
+                audioManager.startBluetoothSco()
+                Log.d(TAG, "Audio routed to Bluetooth SCO")
+            } else {
+                // خيار بديل لو حبيت تفتح السبيكر
+                audioManager.isSpeakerphoneOn = true
+                Log.d(TAG, "Audio routed to Speakerphone")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio routing error: ${e.message}")
+        }
+    }
+
+    private fun resetAudioRouting() {
+        try {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            if (audioManager.isBluetoothScoOn) {
+                audioManager.stopBluetoothSco()
+                audioManager.isBluetoothScoOn = false
+            }
+            if (audioManager.isSpeakerphoneOn) {
+                audioManager.isSpeakerphoneOn = false
+            }
+            audioManager.mode = AudioManager.MODE_NORMAL
+        } catch (e: Exception) {
+            Log.e(TAG, "Error resetting audio: ${e.message}")
+        }
+    }
+
+    private fun rejectIncomingCall() {
+        Log.d(TAG, "Rejecting/Ending phone call via TelecomManager...")
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val telecomManager = getSystemService(Context.TELECOM_SERVICE) as? android.telecom.TelecomManager
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        this,
+                        android.Manifest.permission.ANSWER_PHONE_CALLS
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    @Suppress("DEPRECATION")
+                    telecomManager?.endCall()
+                    Log.d(TAG, "telecomManager.endCall() executed successfully")
+                } else {
+                    Log.w(TAG, "ANSWER_PHONE_CALLS permission not granted on transmitter")
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to end call: ${e.message}")
+        } finally {
+            resetAudioRouting()
+        }
+    }
+
+    private fun handleCallStateChange(stateStr: String, number: String?) {
+        val receiverIpRaw = prefs.getString("receiver_ip", "") ?: ""
+        val receiverPort = prefs.getInt("receiver_port", 8080)
+
+        val targetIps = if (receiverIpRaw.isNotBlank()) {
+            receiverIpRaw.split("[,;\\s]+".toRegex())
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .take(4)
+        } else {
+            emptyList()
+        }
+
+        scope.launch {
+            when (stateStr) {
+                "RINGING", TelephonyManager.EXTRA_STATE_RINGING -> {
+                    var callerName: String? = null
+                    val callerNumber = number
+
+                    if (!callerNumber.isNullOrBlank()) {
+                        callerName = ContactUtils.getContactName(applicationContext, callerNumber)
+                    }
+
+                    val payload = CallPayload(
+                        status = CallPayload.STATUS_RINGING,
+                        number = callerNumber ?: "Unknown",
+                        name = callerName ?: callerNumber ?: "Unknown Caller"
+                    )
+                    
+                    targetIps.forEach { ip ->
+                        launch {
+                            sendPayload(ip, receiverPort, payload)
+                        }
+                    }
+
+                    cloudMirrorManager?.sendPayload(payload)
+                    Log.d(TAG, "Dispatched RINGING payload to cloud and ${targetIps.size} local devices")
+                }
+                "OFFHOOK", TelephonyManager.EXTRA_STATE_OFFHOOK -> {
+                    // المكالمة شغالة حالياً (تم الرد) - منقفلش الشاشة على التليفون الأساسي عشان يقدر يدوس إنهاء لما يخلص
+                    Log.d(TAG, "Call is now OFFHOOK (Active)")
+                }
+                "IDLE", TelephonyManager.EXTRA_STATE_IDLE -> {
+                    resetAudioRouting()
+                    val payload = CallPayload(
+                        status = CallPayload.STATUS_ENDED
+                    )
+                    targetIps.forEach { ip ->
+                        launch {
+                            sendPayload(ip, receiverPort, payload)
+                        }
+                    }
+
+                    cloudMirrorManager?.sendPayload(payload)
+                    Log.d(TAG, "Dispatched ENDED payload to cloud and ${targetIps.size} local devices")
+                }
+            }
+        }
+    }
+
+    private fun sendPayload(ip: String, port: Int, payload: CallPayload) {
+        val code = prefs.getString("cloud_pairing_code", "") ?: ""
+        SecureTransport.send(ip, port, payload, code)
+    }
+
+    private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
-                notifChannelId,
-                "Mirrored App Notifications",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Shows notifications mirrored from primary phone (WhatsApp, SMS, etc.)"
-                enableVibration(true)
-            }
-            nm?.createNotificationChannel(channel)
-        }
-
-        val displayTitle = if (!appName.isNullOrBlank()) "$appName • ${title ?: ""}" else (title ?: "Mirrored Notification")
-        val notification = NotificationCompat.Builder(this, notifChannelId)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(displayTitle)
-            .setContentText(text ?: "")
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text ?: ""))
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-            .setAutoCancel(true)
-            .build()
-
-        nm?.notify(System.currentTimeMillis().toInt(), notification)
-    }
-
-    @Synchronized
-    private fun dismissCurrentAlert() {
-        stopRingtoneAndVibrate()
-        overlayManager?.dismissOverlay()
-        val nm = getSystemService(NotificationManager::class.java)
-        nm?.cancel(ALERT_NOTIFICATION_ID)
-        sendBroadcast(Intent(CallAlertActivity.ACTION_DISMISS_ALERT).setPackage(packageName))
-    }
-
-    @Synchronized
-    private fun triggerRingtoneAndVibrate() {
-        val soundEnabled = prefs.getBoolean("enable_sound", true)
-        val vibrationEnabled = prefs.getBoolean("enable_vibration", true)
-
-        if (soundEnabled) {
-            try {
-                // If already playing cleanly, do not start a duplicate instance!
-                if (mediaPlayer?.isPlaying == true || currentRingtone?.isPlaying == true) {
-                    Log.d(TAG, "Ringtone is already actively playing, skipping duplicate start")
-                    return
-                }
-                stopRingtone()
-
-                var ringtoneUri = RingtoneManager.getActualDefaultRingtoneUri(applicationContext, RingtoneManager.TYPE_RINGTONE)
-                if (ringtoneUri == null) {
-                    ringtoneUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-                        ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-                }
-
-                var playedSuccessfully = false
-                try {
-                    val player = MediaPlayer()
-                    player.setDataSource(applicationContext, ringtoneUri)
-                    player.setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .setLegacyStreamType(AudioManager.STREAM_RING)
-                            .build()
-                    )
-                    player.isLooping = true
-                    player.prepare()
-                    player.start()
-                    mediaPlayer = player
-                    playedSuccessfully = true
-                    Log.d(TAG, "Ringtone started via MediaPlayer")
-                } catch (mpException: Exception) {
-                    Log.w(TAG, "MediaPlayer failed (${mpException.message}), falling back to RingtoneManager")
-                }
-
-                if (!playedSuccessfully) {
-                    val ringtone = RingtoneManager.getRingtone(applicationContext, ringtoneUri)
-                    if (ringtone != null) {
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                            ringtone.audioAttributes = AudioAttributes.Builder()
-                                .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                                .setLegacyStreamType(AudioManager.STREAM_RING)
-                                .build()
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                            ringtone.isLooping = true
-                        }
-                        ringtone.play()
-                        currentRingtone = ringtone
-                        Log.d(TAG, "Ringtone started via RingtoneManager fallback")
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error playing ringtone: ${e.message}")
-            }
-        }
-
-        if (vibrationEnabled) {
-            try {
-                val pattern = longArrayOf(0, 1000, 800, 1000, 800)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    vibrator?.vibrate(VibrationEffect.createWaveform(pattern, 0))
-                } else {
-                    @Suppress("DEPRECATION")
-                    vibrator?.vibrate(pattern, 0)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error triggering vibration: ${e.message}")
-            }
-        }
-    }
-
-    @Synchronized
-    private fun stopRingtone() {
-        try {
-            mediaPlayer?.let {
-                if (it.isPlaying) {
-                    it.stop()
-                }
-                it.reset()
-                it.release()
-            }
-        } catch (ignored: Exception) {}
-        mediaPlayer = null
-
-        try {
-            currentRingtone?.let {
-                if (it.isPlaying) {
-                    it.stop()
-                }
-            }
-        } catch (ignored: Exception) {}
-        currentRingtone = null
-    }
-
-    @Synchronized
-    private fun stopRingtoneAndVibrate() {
-        stopRingtone()
-        try {
-            vibrator?.cancel()
-        } catch (ignored: Exception) {}
-    }
-
-    private fun showHeadsUpNotification(name: String?, number: String?) {
-        val stopIntent = Intent(this, ReceiverService::class.java).apply {
-            action = ACTION_DISMISS
-        }
-        val dismissPendingIntent = PendingIntent.getService(
-            this,
-            99,
-            stopIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val fullScreenIntent = Intent(this, CallAlertActivity::class.java).apply {
-            putExtra(CallAlertActivity.EXTRA_CALLER_NAME, name)
-            putExtra(CallAlertActivity.EXTRA_CALLER_NUMBER, number)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-        }
-        val fullScreenPendingIntent = PendingIntent.getActivity(
-            this,
-            100,
-            fullScreenIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-
-        val alertNotification = NotificationCompat.Builder(this, ALERT_CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle(name ?: "Incoming Call (Hotspot)")
-            .setContentText(number ?: "Incoming Voice Call")
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setCategory(NotificationCompat.CATEGORY_CALL)
-            .setFullScreenIntent(fullScreenPendingIntent, true)
-            .setAutoCancel(true)
-            .addAction(android.R.drawable.ic_lock_silent_mode, "Silence", dismissPendingIntent)
-            .build()
-
-        val notificationManager = getSystemService(NotificationManager::class.java)
-        notificationManager?.notify(ALERT_NOTIFICATION_ID, alertNotification)
-    }
-
-    private fun createNotificationChannels() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-
-            val serviceChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Call Mirror Receiver Service",
+                "Transmitter Call Mirror Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Keeps the socket server listening for incoming calls"
+                description = "Monitors phone calls and mirrors them to Receiver device"
             }
-
-            val alertChannel = NotificationChannel(
-                ALERT_CHANNEL_ID,
-                "Call Mirror Incoming Alerts",
-                NotificationManager.IMPORTANCE_HIGH
-            ).apply {
-                description = "Notifies when an incoming call is mirrored"
-                setBypassDnd(true)
-                enableVibration(false)
-                setSound(null, null)
-            }
-
-            manager?.createNotificationChannel(serviceChannel)
-            manager?.createNotificationChannel(alertChannel)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
         }
     }
 
-    private fun buildForegroundNotification(port: Int): Notification {
+    private fun buildNotification(text: String): Notification {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -455,33 +363,60 @@ class ReceiverService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
-        val stopIntent = Intent(this, ReceiverService::class.java).apply {
+        val stopIntent = Intent(this, TransmitterService::class.java).apply {
             action = ACTION_STOP
         }
         val stopPendingIntent = PendingIntent.getService(
             this,
-            2,
+            1,
             stopIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("CallMirror: Receiver Listening")
-            .setContentText("Socket server active on port $port")
+            .setContentTitle("CallMirror: Transmitter Active")
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Server", stopPendingIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop Service", stopPendingIntent)
             .setOngoing(true)
             .build()
     }
 
+    fun dispatchNotificationPayload(payload: CallPayload) {
+        val receiverIpRaw = prefs.getString("receiver_ip", "") ?: ""
+        val receiverPort = prefs.getInt("receiver_port", 8080)
+
+        val targetIps = if (receiverIpRaw.isNotBlank()) {
+            receiverIpRaw.split("[,;\\s]+".toRegex())
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .take(4)
+        } else {
+            emptyList()
+        }
+
+        scope.launch {
+            targetIps.forEach { ip ->
+                launch {
+                    sendPayload(ip, receiverPort, payload)
+                }
+            }
+            cloudMirrorManager?.sendPayload(payload)
+            Log.d(TAG, "Dispatched NOTIFICATION payload to cloud and ${targetIps.size} local devices")
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        if (instance == this) {
+            instance = null
+        }
         isRunning = false
-        stopRingtoneAndVibrate()
-        overlayManager?.dismissOverlay()
+        resetAudioRouting()
         try {
-            serverSocket?.close()
+            commandServerSocket?.close()
         } catch (ignored: Exception) {}
         job.cancel()
     }
