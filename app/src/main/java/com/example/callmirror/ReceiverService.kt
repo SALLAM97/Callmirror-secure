@@ -51,6 +51,7 @@ class ReceiverService : Service() {
         const val ACTION_START = "com.example.callmirror.RECEIVER_START"
         const val ACTION_STOP = "com.example.callmirror.RECEIVER_STOP"
         const val ACTION_DISMISS = "com.example.callmirror.DISMISS_ALERT"
+        const val ACTION_ANSWER = "com.example.callmirror.RECEIVER_ANSWER"
 
         var isRunning = false
             private set
@@ -93,6 +94,13 @@ class ReceiverService : Service() {
         }
 
         if (action == ACTION_DISMISS) {
+            sendActionToTransmitter(CallPayload.STATUS_REJECT)
+            dismissCurrentAlert()
+            return START_STICKY
+        }
+
+        if (action == ACTION_ANSWER) {
+            sendActionToTransmitter(TransmitterService.CMD_STATUS_ANSWER)
             dismissCurrentAlert()
             return START_STICKY
         }
@@ -142,6 +150,31 @@ class ReceiverService : Service() {
         return START_STICKY
     }
 
+    private fun sendActionToTransmitter(status: String) {
+        scope.launch {
+            val targetIp = lastTransmitterIp ?: prefs.getString("transmitter_ip", "") ?: ""
+            val cmdPort = prefs.getInt("transmitter_cmd_port", 8081)
+            
+            if (targetIp.isNotBlank()) {
+                try {
+                    val payload = CallPayload(status = status)
+                    val code = prefs.getString("cloud_pairing_code", "") ?: ""
+                    SecureTransport.send(targetIp, cmdPort, payload, code)
+                    Log.d(TAG, "Sent command $status to transmitter at $targetIp:$cmdPort")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to send command to transmitter: ${e.message}")
+                }
+            }
+
+            try {
+                val cloudPayload = CallPayload(status = status)
+                cloudMirrorManager?.sendPayload(cloudPayload)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to send command via cloud: ${e.message}")
+            }
+        }
+    }
+
     private fun startServer(port: Int) {
         scope.launch {
             try {
@@ -177,7 +210,6 @@ class ReceiverService : Service() {
         try {
             val localCode = prefs.getString("receiver_cloud_code", "")?.takeIf { it.isNotBlank() }
                 ?: prefs.getString("cloud_pairing_code", "") ?: ""
-            // Only encrypted + authenticated messages are accepted; everything else is dropped.
             val payload = SecureTransport.receive(socket, localCode)
             if (payload != null) {
                 val remoteIp = socket.inetAddress.hostAddress
@@ -199,11 +231,8 @@ class ReceiverService : Service() {
         when (payload.status) {
             CallPayload.STATUS_RINGING -> {
                 Log.d(TAG, "Incoming call alert triggered")
-
-                // Play system ringtone loudly via STREAM_MUSIC or STREAM_RING
                 triggerRingtoneAndVibrate()
 
-                // Display compact heads-up overlay banner
                 val canDrawOverlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     Settings.canDrawOverlays(this)
                 } else {
@@ -278,9 +307,7 @@ class ReceiverService : Service() {
 
         if (soundEnabled) {
             try {
-                // If already playing cleanly, do not start a duplicate instance!
                 if (mediaPlayer?.isPlaying == true || currentRingtone?.isPlaying == true) {
-                    Log.d(TAG, "Ringtone is already actively playing, skipping duplicate start")
                     return
                 }
                 stopRingtone()
@@ -307,9 +334,8 @@ class ReceiverService : Service() {
                     player.start()
                     mediaPlayer = player
                     playedSuccessfully = true
-                    Log.d(TAG, "Ringtone started via MediaPlayer")
                 } catch (mpException: Exception) {
-                    Log.w(TAG, "MediaPlayer failed (${mpException.message}), falling back to RingtoneManager")
+                    Log.w(TAG, "MediaPlayer failed, falling back to RingtoneManager")
                 }
 
                 if (!playedSuccessfully) {
@@ -327,7 +353,6 @@ class ReceiverService : Service() {
                         }
                         ringtone.play()
                         currentRingtone = ringtone
-                        Log.d(TAG, "Ringtone started via RingtoneManager fallback")
                     }
                 }
             } catch (e: Exception) {
